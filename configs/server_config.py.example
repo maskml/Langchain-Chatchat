@@ -20,7 +20,7 @@ WEBUI_SERVER = {
 # api.py server
 API_SERVER = {
     "host": DEFAULT_BIND_HOST,
-    "port": 7861,
+    "port": 7862,
 }
 
 # fastchat openai_api server
