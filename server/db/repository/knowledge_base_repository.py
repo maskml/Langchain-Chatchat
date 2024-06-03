@@ -1,6 +1,12 @@
 from server.db.models.knowledge_base_model import KnowledgeBaseModel
 from server.db.session import with_session
 
+@with_session
+def rename_kb_to_db(session, kb_name, new_kb_name):
+    # 重命名知识库
+    kb = session.query(KnowledgeBaseModel).filter(KnowledgeBaseModel.kb_name.ilike(kb_name)).first()
+    kb.kb_name = new_kb_name
+    return True
 
 @with_session
 def add_kb_to_db(session, kb_name, kb_info, vs_type, embed_model):

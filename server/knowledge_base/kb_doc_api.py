@@ -12,14 +12,201 @@ from fastapi.responses import FileResponse
 from sse_starlette import EventSourceResponse
 from pydantic import Json
 import json
-from server.knowledge_base.kb_service.base import KBServiceFactory
+from server.knowledge_base.kb_service.base import KBServiceFactory, KBService, get_kb_file_details
 from server.db.repository.knowledge_file_repository import get_file_detail
 from langchain.docstore.document import Document
 from server.knowledge_base.model.kb_document_model import DocumentWithVSId
 from typing import List, Dict
-
+import pandas as pd
+import random
 
 def search_docs(
+        mark: bool = Body("", description="是否锁死文档", examples=["True"]),
+        query: str = Body("", description="用户输入", examples=["你好"]),
+        knowledge_base_name: str = Body(..., description="知识库名称", examples=["samples"]),
+        top_k: int = Body(VECTOR_SEARCH_TOP_K, description="匹配向量数"),
+        score_threshold: float = Body(SCORE_THRESHOLD,
+                                      description="知识库匹配相关度阈值，取值范围在0-1之间，"
+                                                  "SCORE越小，相关度越高，"
+                                                  "取到1相当于不筛选，建议设置在0.5左右",
+                                      ge=0, le=1),
+        file_names: str = Body("", description="文件名称，支持 sql 通配符", examples=["filename1,filename2"]),
+        file_name: str = Body("", description="文件名称，支持 sql 通配符"),
+        file_suffx: str = Body("", description="文件后缀，支持 sql 通配符"),
+        metadata: dict = Body({}, description="根据 metadata 进行过滤，仅支持一级键"),
+) -> List[DocumentWithVSId]:
+    # mark暂未用到
+    kb = KBServiceFactory.get_service_by_name(knowledge_base_name)
+    data = []
+    # 当为文档对话时label为F(find)，没找到文档但是匹配到数据NF_M(notfind_match)，没找到文档且没匹配到数据NF_NM
+    label = "NF_NM"
+    if kb is not None:
+        # 优先级：文档对话>数据库搜索对话=传入的文档
+        if file_name and file_name != "未查询到相关文档":
+            print("*************************")
+            print("进行文档对话")
+            print("*************************")
+            # 有相关文档
+            label = "F"
+            data = kb.list_docs(file_name=file_name+"."+file_suffx, metadata={})
+            for d in data:
+                if "vector" in d.metadata:
+                    del d.metadata["vector"]
+        elif not file_name or file_name == "未查询到相关文档":
+            # 没找到相关文档，则进行数据库匹配
+            docs = kb.search_docs(query, top_k, score_threshold)
+            if len(docs) > 0:
+                # 若匹配到相关数据
+                label = "NF_M"
+                if file_names is not None and file_names != "":
+                    print("*************************")
+                    print("未搜索到文档，但是匹配到数据，且有文档输入")
+                    print("*************************")
+                    # 若传入了文件则在搜到的数据中筛选出对应的内容
+                    file_names = file_names.split(",")
+                    data = []
+                    for x in docs:
+                        filename = x[0].metadata.get("source")
+                        if filename in file_names == True:
+                            data.append(DocumentWithVSId(**x[0].dict(), score=x[1], id=x[0].metadata.get("id")))
+                else:
+                    # 若没有传入文件则返回匹配到的内容
+                    print("*************************")
+                    print("未搜索到文档，但是匹配到数据，且没有文档输入")
+                    print("*************************")
+                    data = [DocumentWithVSId(**x[0].dict(), score=x[1], id=x[0].metadata.get("id")) for x in docs]
+            else:
+                data = []
+                if file_names is not None and file_names != "":
+                    # 若有传入的文件则直接搜索对应的文件内容
+                    print("*************************")
+                    print("未搜索到文档，没匹配到数据，且有文档输入")
+                    print("*************************")
+                    file_names = file_names.split(",")
+                    max_len = 0
+                    result = []
+                    for i in range(len(file_names)):
+                        file_data = kb.list_docs(file_name=file_names[i], metadata={})
+                        result.append(file_data)
+                        max_len = len(file_data) if len(file_data) > max_len else max_len
+                    for index in range(max_len):
+                        for item in result:
+                                if index < len(item) :
+                                    data.append(item[index])
+                else:
+                    # 若未匹配到相关数据，则对整个数据库中所有文件进行扫描
+                    print("*************************")
+                    print("未搜索到文档，没匹配到数据，且没有文档输入")
+                    print("*************************")
+                    doc_details = pd.DataFrame(get_kb_file_details(knowledge_base_name))
+                    all_file_name = list(doc_details.loc[:]["file_name"])
+                    if len(all_file_name) >= top_k:
+                        for i in range(len(all_file_name)):
+                            file_data = kb.list_docs(file_name=all_file_name[i], metadata={})
+                            for d in file_data:
+                                if "vector" in d.metadata:
+                                    del d.metadata["vector"]
+                            data.append(file_data[0])
+                    else:
+                        # for i in range(len(all_file_name)):
+                        #     file_data = kb.list_docs(file_name=all_file_name[i], metadata={})
+                        k = 0
+                        while len(data)< top_k and k<top_k:
+                            for i in range(len(all_file_name)):
+                                file_data = kb.list_docs(file_name=all_file_name[i], metadata={})
+                                for d in file_data:
+                                    if "vector" in d.metadata:
+                                        del d.metadata["vector"]
+                                # 防止出现文档的切片数少于k
+                                try:
+                                    data.append(file_data[k])
+                                except:
+                                    continue
+                            k+=1
+    return data,label
+
+def cto_search_docs(
+        query: str = Body("", description="用户输入", examples=["你好"]),
+        knowledge_base_name: str = Body(..., description="知识库名称", examples=["samples"]),
+        top_k: int = Body(VECTOR_SEARCH_TOP_K, description="匹配向量数"),
+        score_threshold: float = Body(SCORE_THRESHOLD,
+                                      description="知识库匹配相关度阈值，取值范围在0-1之间，"
+                                                  "SCORE越小，相关度越高，"
+                                                  "取到1相当于不筛选，建议设置在0.5左右",
+                                      ge=0, le=1),
+        file_name: str = Body("", description="文件名称，支持 sql 通配符", examples=["filename1,filename2"]),
+        metadata: dict = Body({}, description="根据 metadata 进行过滤，仅支持一级键"),
+) -> List[DocumentWithVSId]:
+    kb = KBServiceFactory.get_service_by_name(knowledge_base_name)
+    logger.info("knowlege base")
+    logger.info(knowledge_base_name)
+    if kb is not None:
+       logger.info(kb.list_files())
+    else:
+       logger.info("kb null")
+    logger.info(file_name)
+    logger.info(metadata)
+
+    file_flag = False
+    filename_dict ={}
+
+    if file_name is not None and file_name != "":
+        file_flag  = True
+        filename_dict = {filename.strip():True for filename in file_name.split(",")}
+    logger.info("filenames")
+    logger.info(file_name)
+    logger.info(filename_dict)
+    data = []
+    if kb is not None:
+        if query:
+            docs = kb.search_docs(query, top_k*2, score_threshold)
+            logger.info("docs")
+            logger.info(len(docs))
+            if len(docs) > 0:
+                if file_flag == True:
+                    data = filterDocbynames(docs, filename_dict)
+                else:
+                    data = [DocumentWithVSId(**x[0].dict(), score=x[1], id=x[0].metadata.get("id")) for x in docs]
+            else:
+                if file_flag == True:
+                    data = getalldocs(filename_dict, kb)
+                else:
+                    all_filename_dict = {filename.strip():True for filename in kb.list_files()}
+                    data = getalldocs(all_filename_dict, kb)
+        elif file_flag == True:
+            data = getalldocs(filename_dict, kb)
+
+    if len(data) > top_k:
+        return data[:top_k]
+    else:
+        return data
+
+def filterDocbynames(docs:List[Document], filename_dict: dict)->List[DocumentWithVSId]:
+    data = []
+    for x in docs:
+        filename = x[0].metadata.get("source")
+        if filename_dict.get(filename) == True:
+            data.append(DocumentWithVSId(**x[0].dict(), score=x[1], id=x[0].metadata.get("id")))
+
+    return data
+def getalldocs(filenamedict: dict, kb: KBService)-> List[DocumentWithVSId]:
+    data = []
+    templists=[]
+    maxlen = 0
+    for file_name, exists in filenamedict.items():
+        tempdict = {}
+        tempdata = kb.list_docs(file_name,tempdict)
+        if len(tempdata) > maxlen:
+            maxlen =  len(tempdata)
+        templists.append(tempdata)
+
+    for index in range(maxlen):
+        for doclist in templists:
+            if index < len(doclist) :
+                data.append(doclist[index])
+    return data
+
+def oldsearch_docs(
         query: str = Body("", description="用户输入", examples=["你好"]),
         knowledge_base_name: str = Body(..., description="知识库名称", examples=["samples"]),
         top_k: int = Body(VECTOR_SEARCH_TOP_K, description="匹配向量数"),
@@ -35,13 +222,10 @@ def search_docs(
     data = []
     if kb is not None:
         if query:
-            docs = kb.search_docs(query, top_k, score_threshold)
-            data = [DocumentWithVSId(**x[0].dict(), score=x[1], id=x[0].metadata.get("id")) for x in docs]
+            docs = kb.search_docs(query, top_k*2, score_threshold)
         elif file_name or metadata:
             data = kb.list_docs(file_name=file_name, metadata=metadata)
-            for d in data:
-                if "vector" in d.metadata:
-                    del d.metadata["vector"]
+
     return data
 
 
@@ -61,6 +245,30 @@ def update_docs_by_id(
         return BaseResponse(msg=f"文档更新失败")
 
 
+def rename_file(
+        knowledge_base_name: str = Body(..., description="知识库名称", examples=["samples"]),
+        file_name: str = Body("", description="文件名称"),
+        new_file_name: str = Body("", description="文件新名称"),
+) -> BaseResponse:
+    if not validate_kb_name(knowledge_base_name):
+        return BaseResponse(code=403, msg="Don't attack me")
+    knowledge_base_name = urllib.parse.unquote(knowledge_base_name)
+    kb = KBServiceFactory.get_service_by_name(knowledge_base_name)
+    if kb is None:
+        return BaseResponse(code=404, msg=f"未找到知识库{knowledge_base_name}")
+    # elif file_name not in list_files(knowledge_base_name):
+    #     return BaseResponse(code=404, msg=f"未在知识库 {knowledge_base_name}中找到{file_name}文件")
+    else:
+        try:
+            kb.rename_file(file_name,new_file_name)
+        except Exception as e:
+            msg = f"重命名文件出错： {e}"
+            logger.error(f'{e.__class__.__name__}: {msg}',
+                        exc_info=e if log_verbose else None)
+            return BaseResponse(code=500, msg=msg)
+        return BaseResponse(code=200, msg=f"已重命名文件 {new_file_name}")
+
+
 def list_files(
         knowledge_base_name: str
 ) -> ListResponse:
@@ -74,6 +282,7 @@ def list_files(
     else:
         all_doc_names = kb.list_files()
         return ListResponse(data=all_doc_names)
+
 
 
 def _save_files_in_thread(files: List[UploadFile],
@@ -98,6 +307,7 @@ def _save_files_in_thread(files: List[UploadFile],
                     and not override
                     and os.path.getsize(file_path) == len(file_content)
             ):
+                # TODO: filesize 不同后的处理
                 file_status = f"文件 {filename} 已存在。"
                 logger.warn(file_status)
                 return dict(code=404, msg=file_status, data=data)
@@ -118,6 +328,7 @@ def _save_files_in_thread(files: List[UploadFile],
         yield result
 
 
+# TODO: 等langchain.document_loaders支持内存文件的时候再开通
 # def files2docs(files: List[UploadFile] = File(..., description="上传文件，支持多文件"),
 #                 knowledge_base_name: str = Form(..., description="知识库名称", examples=["samples"]),
 #                 override: bool = Form(False, description="覆盖已有文件"),
@@ -155,7 +366,8 @@ def upload_docs(
 
     failed_files = {}
     file_names = list(docs.keys())
-
+    logger.info("filenames:")
+    logger.info(file_names)
     # 先将上传的文件保存到磁盘
     for result in _save_files_in_thread(files, knowledge_base_name=knowledge_base_name, override=override):
         filename = result["data"]["file_name"]
@@ -260,6 +472,8 @@ def update_docs(
 
     # 生成需要加载docs的文件列表
     for file_name in file_names:
+        logger.info("filename2:")
+        logger.info(file_name)
         file_detail = get_file_detail(kb_name=knowledge_base_name, filename=file_name)
         # 如果该文件之前使用了自定义docs，则根据参数决定略过或覆盖
         if file_detail.get("custom_docs") and not override_custom_docs:

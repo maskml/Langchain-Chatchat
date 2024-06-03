@@ -33,8 +33,7 @@ async def document():
 
 def create_app(run_mode: str = None):
     app = FastAPI(
-        title="Langchain-Chatchat API Server",
-        version=VERSION
+        title="Flock AI API Server"
     )
     MakeFastAPIOffline(app)
     # Add CORS middleware to allow all origins
@@ -135,16 +134,18 @@ def mount_app_routes(app: FastAPI, run_mode: str = None):
             summary="将文本向量化，支持本地模型和在线模型",
             )(embed_texts_endpoint)
 
+    # tools
+
 
 def mount_knowledge_routes(app: FastAPI):
     from server.chat.knowledge_base_chat import knowledge_base_chat
     from server.chat.file_chat import upload_temp_docs, file_chat
     from server.chat.agent_chat import agent_chat
-    from server.knowledge_base.kb_api import list_kbs, create_kb, delete_kb
+    from server.knowledge_base.kb_api import list_kbs, create_kb, delete_kb,rename_kb
     from server.knowledge_base.kb_doc_api import (list_files, upload_docs, delete_docs,
                                                 update_docs, download_doc, recreate_vector_store,
                                                 search_docs, DocumentWithVSId, update_info,
-                                                update_docs_by_id,)
+                                                update_docs_by_id,rename_file,)
 
     app.post("/chat/knowledge_base_chat",
              tags=["Chat"],
@@ -170,7 +171,13 @@ def mount_knowledge_routes(app: FastAPI):
              response_model=BaseResponse,
              summary="创建知识库"
              )(create_kb)
-
+    
+    app.post("/knowledge_base/rename_knowledge_base",
+             tags=["Knowledge Base Management"],
+             response_model=BaseResponse,
+             summary="重命名知识库"
+             )(rename_kb)
+    
     app.post("/knowledge_base/delete_knowledge_base",
              tags=["Knowledge Base Management"],
              response_model=BaseResponse,
@@ -182,6 +189,12 @@ def mount_knowledge_routes(app: FastAPI):
             response_model=ListResponse,
             summary="获取知识库内的文件列表"
             )(list_files)
+    
+    app.post("/knowledge_base/rename_file",
+            tags=["Knowledge Base Management"],
+            response_model=BaseResponse,
+            summary="重命名知识库中文件"
+            )(rename_file)
 
     app.post("/knowledge_base/search_docs",
              tags=["Knowledge Base Management"],

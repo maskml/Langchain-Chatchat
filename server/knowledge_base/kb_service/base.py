@@ -9,12 +9,12 @@ from langchain.docstore.document import Document
 
 from server.db.repository.knowledge_base_repository import (
     add_kb_to_db, delete_kb_from_db, list_kbs_from_db, kb_exists,
-    load_kb_from_db, get_kb_detail,
+    load_kb_from_db, get_kb_detail,rename_kb_to_db,
 )
 from server.db.repository.knowledge_file_repository import (
     add_file_to_db, delete_file_from_db, delete_files_from_db, file_exists_in_db,
     count_files_from_db, list_files_from_db, get_file_detail, delete_file_from_db,
-    list_docs_from_db,
+    list_docs_from_db,rename_file_in_db,
 )
 
 from configs import (kbs_config, VECTOR_SEARCH_TOP_K, SCORE_THRESHOLD,
@@ -24,7 +24,7 @@ from server.knowledge_base.utils import (
     list_kbs_from_folder, list_files_from_folder,
 )
 
-from typing import List, Union, Dict, Optional, Tuple
+from typing import List, Union, Dict, Optional
 
 from server.embeddings_api import embed_texts, aembed_texts, embed_documents
 from server.knowledge_base.model.kb_document_model import DocumentWithVSId
@@ -47,7 +47,6 @@ class SupportedVSType:
     ZILLIZ = 'zilliz'
     PG = 'pg'
     ES = 'es'
-    CHROMADB = 'chromadb'
 
 
 class KBService(ABC):
@@ -72,6 +71,14 @@ class KBService(ABC):
         '''
         pass
 
+    def rename_kb(self,new_knowledge_name):
+        """
+        重命名知识库
+        """
+        # self.do_rename_kb()
+        status = rename_kb_to_db(self.kb_name,new_knowledge_name)
+        return status
+    
     def create_kb(self):
         """
         创建知识库
@@ -168,6 +175,10 @@ class KBService(ABC):
         return file_exists_in_db(KnowledgeFile(knowledge_base_name=self.kb_name,
                                                filename=file_name))
 
+    def rename_file(self,file_name,new_file_name):
+        status = rename_file_in_db(self.kb_name,file_name,new_file_name)
+        return status
+    
     def list_files(self):
         return list_files_from_db(self.kb_name)
 
@@ -192,16 +203,17 @@ class KBService(ABC):
         '''
         传入参数为： {doc_id: Document, ...}
         如果对应 doc_id 的值为 None，或其 page_content 为空，则删除该文档
+        TODO：是否要支持新增 docs ？
         '''
         self.del_doc_by_ids(list(docs.keys()))
-        pending_docs = []
+        docs = []
         ids = []
-        for _id, doc in docs.items():
-            if not doc or not doc.page_content.strip():
+        for k, v in docs.items():
+            if not v or not v.page_content.strip():
                 continue
-            ids.append(_id)
-            pending_docs.append(doc)
-        self.do_add_doc(docs=pending_docs, ids=ids)
+            ids.append(k)
+            docs.append(v)
+        self.do_add_doc(docs=docs, ids=ids)
         return True
 
     def list_docs(self, file_name: str = None, metadata: Dict = {}) -> List[DocumentWithVSId]:
@@ -221,20 +233,6 @@ class KBService(ABC):
                 # 可以选择跳过当前循环迭代或执行其他操作
                 pass
         return docs
-
-    def get_relative_source_path(self,filepath: str):
-      '''
-      将文件路径转化为相对路径，保证查询时一致
-      '''
-      relative_path = filepath
-      if os.path.isabs(relative_path):
-        try:
-          relative_path = Path(filepath).relative_to(self.doc_path)
-        except Exception as e:
-          print(f"cannot convert absolute path ({source}) to relative path. error is : {e}")
-
-      relative_path = str(relative_path.as_posix().strip("/"))
-      return relative_path
 
     @abstractmethod
     def do_create_kb(self):
@@ -275,7 +273,7 @@ class KBService(ABC):
                   query: str,
                   top_k: int,
                   score_threshold: float,
-                  ) -> List[Tuple[Document, float]]:
+                  ) -> List[Document]:
         """
         搜索知识库子类实自己逻辑
         """
@@ -329,15 +327,11 @@ class KBServiceFactory:
             from server.knowledge_base.kb_service.zilliz_kb_service import ZillizKBService
             return ZillizKBService(kb_name, embed_model=embed_model)
         elif SupportedVSType.DEFAULT == vector_store_type:
-            from server.knowledge_base.kb_service.milvus_kb_service import MilvusKBService
             return MilvusKBService(kb_name,
                                    embed_model=embed_model)  # other milvus parameters are set in model_config.kbs_config
         elif SupportedVSType.ES == vector_store_type:
             from server.knowledge_base.kb_service.es_kb_service import ESKBService
             return ESKBService(kb_name, embed_model=embed_model)
-        elif SupportedVSType.CHROMADB == vector_store_type:
-            from server.knowledge_base.kb_service.chromadb_kb_service import ChromaKBService
-            return ChromaKBService(kb_name, embed_model=embed_model)
         elif SupportedVSType.DEFAULT == vector_store_type:  # kb_exists of default kbservice is False, to make validation easier.
             from server.knowledge_base.kb_service.default_kb_service import DefaultKBService
             return DefaultKBService(kb_name)

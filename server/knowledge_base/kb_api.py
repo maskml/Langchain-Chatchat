@@ -11,6 +11,19 @@ def list_kbs():
     # Get List of Knowledge Base
     return ListResponse(data=list_kbs_from_db())
 
+def rename_kb(knowledge_base_name: str = Body(..., examples=["samples"]),
+              new_knowledge_name: str = Body(..., examples=["samples_new"],)
+              ) -> BaseResponse:
+    kb = KBServiceFactory.get_service_by_name(knowledge_base_name)
+    try:
+        kb.rename_kb(new_knowledge_name)
+    except Exception as e:
+        msg = f"重命名知识库出错： {e}"
+        logger.error(f'{e.__class__.__name__}: {msg}',
+                     exc_info=e if log_verbose else None)
+        return BaseResponse(code=500, msg=msg)
+
+    return BaseResponse(code=200, msg=f"已重命名知识库 {new_knowledge_name}")
 
 def create_kb(knowledge_base_name: str = Body(..., examples=["samples"]),
               vector_store_type: str = Body("faiss"),
