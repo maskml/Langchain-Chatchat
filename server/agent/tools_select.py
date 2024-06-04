@@ -1,6 +1,8 @@
 from langchain.tools import Tool
 from server.agent.tools import *
 
+## 请注意，如果你是为了使用AgentLM，在这里，你应该使用英文版本。
+
 tools = [
     Tool.from_function(
         func=calculate,
@@ -18,7 +20,7 @@ tools = [
         func=weathercheck,
         name="weather_check",
         description="",
-        args_schema=WeatherInput,
+        args_schema=WhetherSchema,
     ),
     Tool.from_function(
         func=shell,

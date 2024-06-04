@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union, Optional
 
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain.schema import LLMResult

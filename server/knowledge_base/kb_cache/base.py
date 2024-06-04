@@ -143,6 +143,8 @@ class EmbeddingsPool(CachePool):
                     else:
                         # maybe ReRanker or else, just use empty string instead
                         query_instruction = ""
+                    logger.info("huggingface")
+                    logger.info(model)
                     embeddings = HuggingFaceBgeEmbeddings(model_name=get_model_path(model),
                                                           model_kwargs={'device': device},
                                                           query_instruction=query_instruction)

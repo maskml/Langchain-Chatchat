@@ -1,25 +1,102 @@
 from langchain.utilities.bing_search import BingSearchAPIWrapper
 from langchain.utilities.duckduckgo_search import DuckDuckGoSearchAPIWrapper
 from configs import (BING_SEARCH_URL, BING_SUBSCRIPTION_KEY, METAPHOR_API_KEY,
-                     LLM_MODELS, SEARCH_ENGINE_TOP_K, TEMPERATURE, OVERLAP_SIZE)
-from langchain.chains import LLMChain
-from langchain.callbacks import AsyncIteratorCallbackHandler
-
-from langchain.prompts.chat import ChatPromptTemplate
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.docstore.document import Document
+                     LLM_MODELS, SEARCH_ENGINE_TOP_K, TEMPERATURE,
+                     TEXT_SPLITTER_NAME, OVERLAP_SIZE)
+from configs import logger, log_verbose
 from fastapi import Body
-from fastapi.concurrency import run_in_threadpool
 from sse_starlette import EventSourceResponse
+from fastapi.concurrency import run_in_threadpool
 from server.utils import wrap_done, get_ChatOpenAI
 from server.utils import BaseResponse, get_prompt_template
-from server.chat.utils import History
+from langchain.chains import LLMChain
+from langchain.callbacks import AsyncIteratorCallbackHandler
 from typing import AsyncIterable
 import asyncio
-import json
+from langchain.prompts.chat import ChatPromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List, Optional, Dict
+from server.chat.utils import History
+from langchain.docstore.document import Document
+import json
 from strsimpy.normalized_levenshtein import NormalizedLevenshtein
 from markdownify import markdownify
+import requests
+from fastapi import HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+
+# If the user did not provide a query, we will use this default query.
+_default_query = "Who said 'live long and prosper'?"
+
+# This is really the most important part of the rag model. It gives instructions
+# to the model on how to generate the answer. Of course, different models may
+# behave differently, and we haven't tuned the prompt to make it optimal - this
+# is left to you, application creators, as an open problem.
+_rag_query_text = """
+You help me do two things:
+
+First:
+You are a large language AI assistant built by Greedy AI. You are given a user question, and please write clean, concise and accurate answer to the question. You will be given a set of related contexts to the question, each starting with a reference number like [[出处:x]], where x is a number. Please use the context and cite the context at the end of each sentence if applicable.
+
+Your answer must be correct, accurate and written by an expert using an unbiased and professional tone. Please limit to 1024 tokens. Do not give any information that is not related to the question, and do not repeat. Say "information is missing on" followed by the related topic, if the given context do not provide sufficient information.
+
+Please cite the contexts with the reference numbers, in the format [出处:x]. If a sentence comes from multiple contexts, please list all applicable citations, like [出处:3][出处:5]. Other than code and specific names and citations, your answer must be written in the same language as the question.
+
+Here are the set of contexts:
+
+{{ context }}
+
+Remember, don't blindly repeat the contexts verbatim. And here is the user question:
+{{ question }}
+
+Last, return the answer in JSON using the key "searchA"， 比如{"searchA":"value1"}
+
+Second:
+You are a helpful assistant that helps the user to ask related questions, based on user's original question and the related contexts. Please identify worthwhile topics that can be follow-ups, and write questions no longer than 20 words each. Please make sure that specifics, like events, names, locations, are included in follow up questions so they can be asked standalone. For example, if the original question asks about "the Manhattan project", in the follow up question, do not just say "the project", but use the full name "the Manhattan project". Your related questions must be in the same language as the original question.
+
+Here are the contexts of the question:
+
+{context}
+
+Remember, based on the original question and related contexts, suggest three such further questions. Do NOT repeat the original question. Each related question should be no longer than 20 words. Here is the original question:
+
+Last, return the answer in JSON using the key "relatedQ"， 比如{"relatedQ":"value2"}
+
+合并2个json，比如{"searchA":"value1", "relatedQ":"value2"}
+"""
+
+# A set of stop words to use - this is not a complete set, and you may want to
+# add more given your observation.
+stop_words = [
+    "<|im_end|>",
+    "[End]",
+    "[end]",
+    "\nReferences:\n",
+    "\nSources:\n",
+    "End.",
+]
+
+# This is the prompt that asks the model to generate related questions to the
+# original question and the contexts.
+# Ideally, one want to include both the original question and the answer from the
+# model, but we are not doing that here: if we need to wait for the answer, then
+# the generation of the related questions will usually have to start only after
+# the whole answer is generated. This creates a noticeable delay in the response
+# time. As a result, and as you will see in the code, we will be sending out two
+# consecutive requests to the model: one for the answer, and one for the related
+# questions. This is not ideal, but it is a good tradeoff between response time
+# and quality.
+_more_questions_prompt = """
+You are a helpful assistant that helps the user to ask related questions, based on user's original question and the related contexts. Please identify worthwhile topics that can be follow-ups, and write questions no longer than 20 words each. Please make sure that specifics, like events, names, locations, are included in follow up questions so they can be asked standalone. For example, if the original question asks about "the Manhattan project", in the follow up question, do not just say "the project", but use the full name "the Manhattan project". Your related questions must be in the same language as the original question.
+
+Here are the contexts of the question:
+
+{{context}}
+
+Remember, based on the original question and related contexts, suggest three such further questions. Do NOT repeat the original question. Each related question should be no longer than 20 words. Here is the original question:
+{{ question }}
+"""
+
 
 
 def bing_search(text, result_len=SEARCH_ENGINE_TOP_K, **kwargs):
@@ -29,8 +106,32 @@ def bing_search(text, result_len=SEARCH_ENGINE_TOP_K, **kwargs):
                  "link": "https://python.langchain.com/en/latest/modules/agents/tools/examples/bing_search.html"}]
     search = BingSearchAPIWrapper(bing_subscription_key=BING_SUBSCRIPTION_KEY,
                                   bing_search_url=BING_SEARCH_URL)
+    logger.info(BING_SUBSCRIPTION_KEY)
     return search.results(text, result_len)
 
+def newbing_search(text, result_len=SEARCH_ENGINE_TOP_K, **kwargs):
+    """
+    Search with bing and return the contexts.
+    """
+    params = {"q": text, "mkt": "en-US"}
+    response = requests.get(
+        BING_SEARCH_URL,
+        headers={"Ocp-Apim-Subscription-Key": BING_SUBSCRIPTION_KEY},
+        params=params,
+        timeout=5
+    )
+    if not response.ok:
+        logger.error(f"{response.status_code} {response.text}")
+        raise HTTPException(response.status_code, "Search engine error.")
+    json_content = response.json()
+    logger.info("newbing search result:")
+    logger.info(json_content)
+    try:
+        contexts = json_content["webPages"]["value"][:result_len]
+    except KeyError:
+        logger.error(f"Error encountered: {json_content}")
+        return []
+    return contexts
 
 def duckduckgo_search(text, result_len=SEARCH_ENGINE_TOP_K, **kwargs):
     search = DuckDuckGoSearchAPIWrapper()
@@ -113,8 +214,9 @@ async def lookup_search_engine(
     docs = search_result2docs(results)
     return docs
 
+
 async def search_engine_chat(query: str = Body(..., description="用户输入", examples=["你好"]),
-                             search_engine_name: str = Body(..., description="搜索引擎名称", examples=["duckduckgo"]),
+                             search_engine_name: str = Body(..., description="搜索引擎名称", examples=["bing"]),
                              top_k: int = Body(SEARCH_ENGINE_TOP_K, description="检索结果数量"),
                              history: List[History] = Body([],
                                                            description="历史对话",
@@ -160,14 +262,28 @@ async def search_engine_chat(query: str = Body(..., description="用户输入", 
             max_tokens=max_tokens,
             callbacks=[callback],
         )
-
+        logger.info("topk")
+        logger.info(top_k)
         docs = await lookup_search_engine(query, search_engine_name, top_k, split_result=split_result)
-        context = "\n".join([doc.page_content for doc in docs])
+        context = ""
+        for inum, doc in enumerate(docs):
+            context = context+"出处["+str(inum+1)+"]"+doc.page_content+"\n"
 
+        #context = "\n".join([doc.page_content for doc in docs])
+        logger.info("context")
+        logger.info(context)
         prompt_template = get_prompt_template("search_engine_chat", prompt_name)
+        prompt_template = _rag_query_text
+        logger.info("template")
+        logger.info(prompt_template)
         input_msg = History(role="user", content=prompt_template).to_msg_template(False)
+        logger.info("input_msg")
+        logger.info(input_msg)
+
         chat_prompt = ChatPromptTemplate.from_messages(
             [i.to_msg_template() for i in history] + [input_msg])
+        logger.info("chatprompt")
+        logger.info(chat_prompt)
 
         chain = LLMChain(prompt=chat_prompt, llm=model)
 
@@ -178,7 +294,7 @@ async def search_engine_chat(query: str = Body(..., description="用户输入", 
         )
 
         source_documents = [
-            f"""出处 [{inum + 1}] [{doc.metadata["source"]}]({doc.metadata["source"]}) \n\n{doc.page_content}\n\n"""
+            f"""[出处:{inum + 1}] [{doc.metadata["source"]}]({doc.metadata["source"]}) \n\n{doc.page_content}\n\n"""
             for inum, doc in enumerate(docs)
         ]
 

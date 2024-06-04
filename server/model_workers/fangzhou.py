@@ -12,20 +12,21 @@ class FangZhouWorker(ApiModelWorker):
     """
 
     def __init__(
-            self,
-            *,
-            model_names: List[str] = ["fangzhou-api"],
-            controller_addr: str = None,
-            worker_addr: str = None,
-            version: Literal["chatglm-6b-model"] = "chatglm-6b-model",
-            **kwargs,
+        self,
+        *,
+        model_names: List[str] = ["fangzhou-api"],
+        controller_addr: str = None,
+        worker_addr: str = None,
+        version: Literal["chatglm-6b-model"] = "chatglm-6b-model",
+        **kwargs,
     ):
         kwargs.update(model_names=model_names, controller_addr=controller_addr, worker_addr=worker_addr)
-        kwargs.setdefault("context_len", 16384)
+        kwargs.setdefault("context_len", 16384) # TODO: 不同的模型有不同的大小
         super().__init__(**kwargs)
         self.version = version
+
     def do_chat(self, params: ApiChatParams) -> Dict:
-        from volcengine.maas.v2 import MaasService
+        from volcengine.maas import MaasService
 
         params.load_config(self.model_names[0])
         maas = MaasService('maas-api.ml-platform-cn-beijing.volces.com', 'cn-beijing')
@@ -34,6 +35,9 @@ class FangZhouWorker(ApiModelWorker):
 
         # document: "https://www.volcengine.com/docs/82379/1099475"
         req = {
+            "model": {
+                "name": params.version,
+            },
             "parameters": {
                 # 这里的参数仅为示例，具体可用的参数请参考具体模型的 API 说明
                 "max_new_tokens": params.max_tokens,
@@ -45,24 +49,24 @@ class FangZhouWorker(ApiModelWorker):
         text = ""
         if log_verbose:
             self.logger.info(f'{self.__class__.__name__}:maas: {maas}')
-        for resp in maas.stream_chat(params.version, unicode_escape_data(req)):
-            error = resp.error
-            if error and error.code_n > 0:
-                data = {
-                    "error_code": error.code_n,
-                    "text": error.message,
-                    "error": {
-                        "message": error.message,
-                        "type": "invalid_request_error",
-                        "param": None,
-                        "code": None,
-                    }
-                }
-                self.logger.error(f"请求方舟 API 时发生错误：{data}")
-                yield data
-            elif chunk := resp.choices and resp.choices[0].message.content:
-                text += chunk
-                yield {"error_code": 0, "text": text}
+        for resp in maas.stream_chat(req):
+            if error := resp.error:
+                if error.code_n > 0:
+                    data = {
+                            "error_code": error.code_n,
+                            "text": error.message,
+                            "error": {
+                                "message": error.message,
+                                "type": "invalid_request_error",
+                                "param": None,
+                                "code": None,
+                            }
+                        }
+                    self.logger.error(f"请求方舟 API 时发生错误：{data}")
+                    yield data
+                elif chunk := resp.choice.message.content:
+                    text += chunk
+                    yield {"error_code": 0, "text": text}
             else:
                 data = {
                     "error_code": 500,
@@ -73,6 +77,7 @@ class FangZhouWorker(ApiModelWorker):
                 break
 
     def get_embeddings(self, params):
+        # TODO: 支持embeddings
         print("embedding")
         print(params)
 
@@ -86,16 +91,6 @@ class FangZhouWorker(ApiModelWorker):
             stop_str="###",
         )
 
-
-def unicode_escape_data(data):
-    if isinstance(data, str):
-        return data.encode('unicode_escape').decode('ascii')
-    elif isinstance(data, dict):
-        return {key: unicode_escape_data(value) for key, value in data.items()}
-    elif isinstance(data, list):
-        return [unicode_escape_data(item) for item in data]
-    else:
-        return data
 
 if __name__ == "__main__":
     import uvicorn

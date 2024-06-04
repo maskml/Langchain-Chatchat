@@ -1,142 +1,96 @@
-from contextlib import contextmanager
-
-import httpx
-import requests
 from fastchat.conversation import Conversation
-from httpx_sse import EventSource
-
 from server.model_workers.base import *
 from fastchat import conversation as conv
 import sys
-from typing import List, Dict, Iterator, Literal, Any
-import jwt
-import time
-
-
-@contextmanager
-def connect_sse(client: httpx.Client, method: str, url: str, **kwargs: Any):
-    with client.stream(method, url, **kwargs) as response:
-        yield EventSource(response)
-
-
-def generate_token(apikey: str, exp_seconds: int):
-    try:
-        id, secret = apikey.split(".")
-    except Exception as e:
-        raise Exception("invalid apikey", e)
-
-    payload = {
-        "api_key": id,
-        "exp": int(round(time.time() * 1000)) + exp_seconds * 1000,
-        "timestamp": int(round(time.time() * 1000)),
-    }
-
-    return jwt.encode(
-        payload,
-        secret,
-        algorithm="HS256",
-        headers={"alg": "HS256", "sign_type": "SIGN"},
-    )
+from typing import List, Dict, Iterator, Literal
+from configs import logger, log_verbose
 
 
 class ChatGLMWorker(ApiModelWorker):
-    DEFAULT_EMBED_MODEL = "embedding-2"
-    
+    DEFAULT_EMBED_MODEL = "text_embedding"
+
     def __init__(
-            self,
-            *,
-            model_names: List[str] = ("zhipu-api",),
-            controller_addr: str = None,
-            worker_addr: str = None,
-            version: Literal["glm-4"] = "glm-4",
-            **kwargs,
+        self,
+        *,
+        model_names: List[str] = ["zhipu-api"],
+        controller_addr: str = None,
+        worker_addr: str = None,
+        version: Literal["chatglm_turbo"] = "chatglm_turbo",
+        **kwargs,
     ):
         kwargs.update(model_names=model_names, controller_addr=controller_addr, worker_addr=worker_addr)
-        kwargs.setdefault("context_len", 4096)
+        kwargs.setdefault("context_len", 32768)
         super().__init__(**kwargs)
         self.version = version
 
     def do_chat(self, params: ApiChatParams) -> Iterator[Dict]:
+        # TODO: 维护request_id
+        import zhipuai
+
         params.load_config(self.model_names[0])
-        token = generate_token(params.api_key, 60)
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-        data = {
-            "model": params.version,
-            "messages": params.messages,
-            "max_tokens": params.max_tokens,
-            "temperature": params.temperature,
-            "stream": False
-        }
+        zhipuai.api_key = params.api_key
 
-        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-        with httpx.Client(headers=headers) as client:
-            response = client.post(url, json=data)
-            response.raise_for_status()
-            chunk = response.json()
-            print(chunk)
-            yield {"error_code": 0, "text": chunk["choices"][0]["message"]["content"]}
+        if log_verbose:
+            logger.info(f'{self.__class__.__name__}:params: {params}')
 
-            # with connect_sse(client, "POST", url, json=data) as event_source:
-            #     for sse in event_source.iter_sse():
-            #         chunk = json.loads(sse.data)
-            #         if len(chunk["choices"]) != 0:
-            #             text += chunk["choices"][0]["delta"]["content"]
-            #             yield {"error_code": 0, "text": text}
-
+        response = zhipuai.model_api.sse_invoke(
+            model=params.version,
+            prompt=params.messages,
+            temperature=params.temperature,
+            top_p=params.top_p,
+            incremental=False,
+        )
+        for e in response.events():
+            if e.event == "add":
+                yield {"error_code": 0, "text": e.data}
+            elif e.event in ["error", "interrupted"]:
+                data = {
+                    "error_code": 500,
+                    "text": e.data,
+                    "error": {
+                        "message": e.data,
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": None,
+                    }
+                }
+                self.logger.error(f"请求智谱 API 时发生错误：{data}")
+                yield data
 
     def do_embeddings(self, params: ApiEmbeddingsParams) -> Dict:
-        embed_model = params.embed_model or self.DEFAULT_EMBED_MODEL
+        import zhipuai
 
         params.load_config(self.model_names[0])
-        i = 0
-        batch_size = 1
-        result = []
-        while i < len(params.texts):
-            token = generate_token(params.api_key, 60)
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}"
-            }
-            data = {
-                "model": embed_model,
-                "input": "".join(params.texts[i: i + batch_size])
-            }
-            embedding_data = self.request_embedding_api(headers, data, 1)
-            if embedding_data:
-                result.append(embedding_data)
-            i += batch_size
-            print(f"请求{embed_model}接口处理第{i}块文本，返回embeddings: \n{embedding_data}")
+        zhipuai.api_key = params.api_key
 
-        return {"code": 200, "data": result}
-
-    # 请求接口，支持重试
-    def request_embedding_api(self, headers, data, retry=0):
-        response = ''
+        embeddings = []
         try:
-            url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
-            response = requests.post(url, headers=headers, json=data)
-            ans = response.json()
-            return ans["data"][0]["embedding"]
+            for t in params.texts:
+                response = zhipuai.model_api.invoke(model=params.embed_model or self.DEFAULT_EMBED_MODEL, prompt=t)
+                if response["code"] == 200:
+                    embeddings.append(response["data"]["embedding"])
+                else:
+                    self.logger.error(f"请求智谱 API 时发生错误：{response}")
+                    return response  # dict with code & msg
         except Exception as e:
-            print(f"request_embedding_api error={e} \nresponse={response}")
-            if retry > 0:
-                return self.request_embedding_api(headers, data, retry - 1)
-            else:
-                return None
+            self.logger.error(f"请求智谱 API 时发生错误：{data}")
+            data = {"code": 500, "msg": f"对文本向量化时出错：{e}"}
+            return data
+
+        return {"code": 200, "data": embeddings}
 
     def get_embeddings(self, params):
+        # TODO: 支持embeddings
         print("embedding")
-        print(params)
+        # print(params)
 
     def make_conv_template(self, conv_template: str = None, model_path: str = None) -> Conversation:
+        # 这里的是chatglm api的模板，其它API的conv_template需要定制
         return conv.Conversation(
             name=self.model_names[0],
-            system_message="你是智谱AI小助手，请根据用户的提示来完成任务",
+            system_message="你是一个聪明的助手，请根据用户的提示来完成任务",
             messages=[],
-            roles=["user", "assistant", "system"],
+            roles=["Human", "Assistant", "System"],
             sep="\n###",
             stop_str="###",
         )

@@ -13,6 +13,7 @@ async def request(appid, api_key, api_secret, Spark_url, domain, question, tempe
     wsParam = SparkApi.Ws_Param(appid, api_key, api_secret, Spark_url)
     wsUrl = wsParam.create_url()
     data = SparkApi.gen_params(appid, domain, question, temperature, max_token)
+    print(data)
     async with websockets.connect(wsUrl) as ws:
         await ws.send(json.dumps(data, ensure_ascii=False))
         finish = False
@@ -36,18 +37,18 @@ class XingHuoWorker(ApiModelWorker):
             **kwargs,
     ):
         kwargs.update(model_names=model_names, controller_addr=controller_addr, worker_addr=worker_addr)
-        kwargs.setdefault("context_len", 8000)
+        kwargs.setdefault("context_len", 8000) # TODO: V1模型的最大长度为4000，需要自行修改
         super().__init__(**kwargs)
         self.version = version
 
     def do_chat(self, params: ApiChatParams) -> Dict:
+        # TODO: 当前每次对话都要重新连接websocket，确认是否可以保持连接
         params.load_config(self.model_names[0])
 
         version_mapping = {
-            "v1.5": {"domain": "general", "url": "ws://spark-api.xf-yun.com/v1.1/chat", "max_tokens": 4000},
-            "v2.0": {"domain": "generalv2", "url": "ws://spark-api.xf-yun.com/v2.1/chat", "max_tokens": 8000},
-            "v3.0": {"domain": "generalv3", "url": "ws://spark-api.xf-yun.com/v3.1/chat", "max_tokens": 8000},
-            "v3.5": {"domain": "generalv3", "url": "ws://spark-api.xf-yun.com/v3.5/chat", "max_tokens": 16000},
+            "v1.5": {"domain": "general", "url": "ws://spark-api.xf-yun.com/v1.1/chat","max_tokens": 4000},
+            "v2.0": {"domain": "generalv2", "url": "ws://spark-api.xf-yun.com/v2.1/chat","max_tokens": 8000},
+            "v3.0": {"domain": "generalv3", "url": "ws://spark-api.xf-yun.com/v3.1/chat","max_tokens": 8000},
         }
 
         def get_version_details(version_key):
@@ -72,10 +73,12 @@ class XingHuoWorker(ApiModelWorker):
                 yield {"error_code": 0, "text": text}
 
     def get_embeddings(self, params):
+        # TODO: 支持embeddings
         print("embedding")
         print(params)
 
     def make_conv_template(self, conv_template: str = None, model_path: str = None) -> Conversation:
+        # TODO: 确认模板是否需要修改
         return conv.Conversation(
             name=self.model_names[0],
             system_message="你是一个聪明的助手，请根据用户的提示来完成任务",

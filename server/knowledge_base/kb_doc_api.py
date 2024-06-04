@@ -245,6 +245,12 @@ def update_docs_by_id(
         return BaseResponse(msg=f"文档更新失败")
 
 
+# def rename_file(
+#         knowledge_base_name: str,
+#         file_name:str,
+#         new_file_name:str
+# )-> BaseResponse:
+
 def rename_file(
         knowledge_base_name: str = Body(..., description="知识库名称", examples=["samples"]),
         file_name: str = Body("", description="文件名称"),
